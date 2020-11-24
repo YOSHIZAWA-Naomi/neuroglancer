@@ -1,6 +1,6 @@
 name: Build
 
-on: [push]
+on: [push, pull_request]
 
 jobs:
   client:
@@ -47,6 +47,15 @@ jobs:
       run: npm run test -- --browsers ChromeHeadless --define=NEUROGLANCER_SKIP_WEBGL_TESTS
     - name: Run JavaScript benchmarks
       run: npm run benchmark
+
+  # Builds Python package and runs Python tests
+  #
+  # On ubuntu-latest, this also runs browser-based tests.  On Mac OS and
+  # Windows, this only runs tests that do not require a browser, since a working
+  # headless WebGL2 implementation is not available on Github actions.
+  #
+  # On macOS and Windows, this also builds binary wheels and uploads them as
+  # build artifacts for the `pypa-upload` job.
   python:
     strategy:
       matrix:
@@ -54,6 +63,7 @@ jobs:
           - '3.6'
           - '3.7'
           - '3.8'
+          - '3.9'
         node-version:
           - '14.x'
         os:
@@ -63,6 +73,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v2
+      with:
+        # Need full history to determine version number.
+        fetch-depth: 0
     - name: Use Node.js ${{ matrix.node-version }}
       uses: actions/setup-node@v1
       with:
@@ -83,33 +96,134 @@ jobs:
       with:
         path: ${{ steps.pip-cache.outputs.dir }}
         key: ${{ runner.os }}-${{ matrix.python-version }}-pip-${{ hashFiles('python/setup.py') }}
-    - run: npm install
-    - run: npm run build-python -- --no-typecheck
-    - name: Build and install Python package
-      working-directory: python
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install numpy pytest-rerunfailures pytest-timeout
-        pip install .[test]
-    - run: sudo apt-get install xvfb
-      if: ${{ startsWith(runner.os, 'Linux') }}
     # Uncomment the action below for an interactive shell
     # - name: Setup tmate session
     #   uses: mxschmitt/action-tmate@v3
-    - name: Test with pytest (including web browser tests)
-      working-directory: python/tests
-      # browser-based tests are flaky and can hang, so set a 30 second timeout and retry up to 5 times.
-      # Use `timeout_func_only=true` to work around https://github.com/pytest-dev/pytest-rerunfailures/issues/99
-      run: xvfb-run --auto-servernum --server-args='-screen 0 1024x768x24' pytest --browser=firefox -vv -s --reruns 5 --timeout=30 -o timeout_func_only=true
-      env:
-        PYTHONUNBUFFERED: 1
+    - run: npm install
+    - run: npm run build-python -- --no-typecheck
+    - name: Install Python packaging/test tools
+      run: python -m pip install --upgrade pip tox wheel numpy pytest
+    - run: sudo apt-get install xvfb
       if: ${{ startsWith(runner.os, 'Linux') }}
-    - name: Test with pytest (excluding web browser tests)
+    - name: Test with tox
+      working-directory: python
+      run: tox -e ${{ fromJSON('["skip-browser-tests","firefox-xvfb"]')[runner.os == 'Linux'] }}
+    - name: Build Python source distribution (sdist)
+      working-directory: python
+      run: python setup.py sdist --format=gztar
+    - name: Install in editable form
+      working-directory: python
+      run: pip install -e .
+    - name: Run tests against editable install
       working-directory: python/tests
-      run: pytest -vv -s --skip-browser-tests
-      env:
-        PYTHONUNBUFFERED: 1
+      run: pytest -vv --skip-browser-tests
+    # On Mac OS and Windows, build binary wheels for the selected Python version
+    # as part of this job, and upload as build artifacts.
+    #
+    # On Linux, binary wheels are built as a separate job using a manylinux
+    # container.
+    - name: Build binary wheel (non-Linux)
+      working-directory: python
+      run: python setup.py bdist_wheel
       if: ${{ !startsWith(runner.os, 'Linux') }}
+    - name: Make binary wheel portable (macOS)
+      if: ${{ runner.os == 'macOS' }}
+      run: |
+        pip install delocate
+        delocate-wheel --version
+        for whl in python/dist/*.whl; do
+          delocate-wheel $whl
+          echo $whl
+        done
+    - name: Upload binary wheel as artifact (non-Linux)
+      uses: actions/upload-artifact@v2
+      with:
+        name: python-wheel-${{ matrix.os }}-${{ matrix.python-version }}
+        path: |
+          python/dist/*.whl
+      if: ${{ !startsWith(runner.os, 'Linux') }}
+
+  # Builds manylinux Python wheels, and uploads the source distribution and all
+  # of the binary wheels to pypi test server (and to non-test server for tagged
+  # versions).
+  python-manylinux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        # Need full history to determine version number.
+        fetch-depth: 0
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v1
+      with:
+        node-version: ${{ matrix.node-version }}
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.x
+    - uses: actions/cache@v2
+      with:
+        path: "**/node_modules"
+        key: ${{ runner.os }}-${{ matrix.node-version }}-node_modules-${{ hashFiles('**/package-lock.json') }}
+    - uses: actions/cache@v2
+      with:
+        path: ${{ github.workspace }}/.pip_cache
+        key: manylinux-pip-${{ hashFiles('python/setup.py') }}
+    - run: npm install
+    - run: npm run build-python -- --no-typecheck
+    - name: Install Python packaging tools
+      run: python -m pip install --upgrade pip wheel
+    - run: python setup.py sdist --format gztar
+      working-directory: python
+      # Unfortunately, actions/setup-python sets LD_LIBRARY_PATH
+      # (https://github.com/actions/runner/issues/781)
+      #
+      # However, that does not cause a problem in practice because we also set
+      # it inside the `build_manylinux_wheels_inside_container.sh` script.
+    - name: Build manylinux wheels
+      uses: docker://quay.io/pypa/manylinux2010_x86_64
+      with:
+        args: ./python/build_tools/build_manylinux_wheels_inside_container_on_github_actions.sh
+      env:
+        PIP_CACHE_DIR: /github/workspace/.pip_cache
+    - name: Upload sdist and wheels as artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: python-wheel-manylinux
+        path: |
+          python/dist/*.whl
+          python/dist/*.tar.gz
+  pypa-upload:
+    # Only publish package on push to tag or default branch.
+    if: ${{ github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master') }}
+    runs-on: ubuntu-latest
+    needs:
+      - 'python'
+      - 'python-manylinux'
+    steps:
+    - uses: actions/download-artifact@v2
+      with:
+        name: python-wheel-manylinux
+        path: dist
+    - uses: actions/download-artifact@v2
+      with:
+        name: python-wheel-macos-latest
+        path: dist
+    - uses: actions/download-artifact@v2
+      with:
+        name: python-wheel-windows-latest
+        path: dist
+    # - name: Publish to PyPI (test server)
+    #   uses: pypa/gh-action-pypi-publish@54b39fb9371c0b3a6f9f14bb8a67394defc7a806 # 2020-09-25
+    #   with:
+    #     user: __token__
+    #     password: ${{ secrets.pypi_test_token }}
+    # - name: Publish to PyPI (main server)
+    #   uses: pypa/gh-action-pypi-publish@54b39fb9371c0b3a6f9f14bb8a67394defc7a806 # 2020-09-25
+    #   with:
+    #     user: __token__
+    #     password: ${{ secrets.pypi_token }}
+    #   if: ${{ startWith(github.ref, 'refs/tags/v') }}
   ngauth:
     strategy:
       matrix:

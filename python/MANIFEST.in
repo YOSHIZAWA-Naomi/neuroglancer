@@ -1,9 +1,12 @@
 prune examples
 prune tests
 prune testdata
+prune build_tools
+prune *.egg-info
 exclude tox.ini
 exclude .pylintrc
 exclude .gitignore
 exclude .dockerignore
 exclude Dockerfile
 exclude CMakeLists.txt
+exclude MANIFEST.in
